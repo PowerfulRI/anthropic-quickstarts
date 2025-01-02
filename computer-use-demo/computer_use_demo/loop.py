@@ -7,6 +7,11 @@ from collections.abc import Callable
 from datetime import datetime
 from enum import StrEnum
 from typing import Any, cast
+import asyncio
+import random
+import time
+from dataclasses import dataclass, field
+from typing import ClassVar, Dict
 
 import httpx
 from anthropic import (
@@ -16,6 +21,7 @@ from anthropic import (
     APIError,
     APIResponseValidationError,
     APIStatusError,
+    RateLimitError,
 )
 from anthropic.types.beta import (
     BetaCacheControlEphemeralParam,
@@ -70,6 +76,42 @@ SYSTEM_PROMPT = f"""<SYSTEM_CAPABILITY>
 </IMPORTANT>"""
 
 
+@dataclass
+class RateLimiter:
+    """Tracks API calls and enforces rate limits"""
+    requests_per_minute: int = 25  # Even more conservative than before
+    last_request_times: Dict[str, list[float]] = field(default_factory=dict)
+    _instance: ClassVar[Any] = None
+
+    def __new__(cls):
+        if cls._instance is None:
+            cls._instance = super().__new__(cls)
+        return cls._instance
+
+    async def wait_if_needed(self, key: str = "default"):
+        """Wait if we're approaching rate limits"""
+        now = time.time()
+        if key not in self.last_request_times:
+            self.last_request_times[key] = []
+        
+        # Remove requests older than 1 minute
+        self.last_request_times[key] = [
+            t for t in self.last_request_times[key] 
+            if now - t < 60
+        ]
+        
+        # If we're approaching the limit, add a delay
+        if len(self.last_request_times[key]) >= self.requests_per_minute * 0.6:  # Even more conservative threshold
+            # Calculate required delay to stay under limit
+            oldest_request = self.last_request_times[key][0]
+            wait_time = 60 - (now - oldest_request)
+            if wait_time > 0:
+                print(f"Preemptively waiting {wait_time + 2:.2f} seconds to avoid rate limit...")
+                await asyncio.sleep(wait_time + 2)  # Add 2 second buffer
+        
+        # Add current request
+        self.last_request_times[key].append(now)
+
 async def sampling_loop(
     *,
     model: str,
@@ -84,6 +126,8 @@ async def sampling_loop(
     api_key: str,
     only_n_most_recent_images: int | None = None,
     max_tokens: int = 4096,
+    max_retries: int = 5,  # Maximum number of retries for rate limits
+    initial_retry_delay: float = 2.0,  # Initial retry delay in seconds
 ):
     """
     Agentic sampling loop for the assistant/tool interaction of computer use.
@@ -97,6 +141,8 @@ async def sampling_loop(
         type="text",
         text=f"{SYSTEM_PROMPT}{' ' + system_prompt_suffix if system_prompt_suffix else ''}",
     )
+    
+    rate_limiter = RateLimiter()
 
     while True:
         enable_prompt_caching = False
@@ -113,8 +159,6 @@ async def sampling_loop(
         if enable_prompt_caching:
             betas.append(PROMPT_CACHING_BETA_FLAG)
             _inject_prompt_caching(messages)
-            # Because cached reads are 10% of the price, we don't think it's
-            # ever sensible to break the cache by truncating images
             only_n_most_recent_images = 0
             system["cache_control"] = {"type": "ephemeral"}
 
@@ -125,25 +169,44 @@ async def sampling_loop(
                 min_removal_threshold=image_truncation_threshold,
             )
 
-        # Call the API
-        # we use raw_response to provide debug information to streamlit. Your
-        # implementation may be able call the SDK directly with:
-        # `response = client.messages.create(...)` instead.
-        try:
-            raw_response = client.beta.messages.with_raw_response.create(
-                max_tokens=max_tokens,
-                messages=messages,
-                model=model,
-                system=[system],
-                tools=tool_collection.to_params(),
-                betas=betas,
-            )
-        except (APIStatusError, APIResponseValidationError) as e:
-            api_response_callback(e.request, e.response, e)
-            return messages
-        except APIError as e:
-            api_response_callback(e.request, e.body, e)
-            return messages
+        # Call the API with rate limiting and retry logic
+        retry_count = 0
+        retry_delay = initial_retry_delay
+        
+        while True:
+            # Wait if we're approaching rate limits
+            await rate_limiter.wait_if_needed(str(provider))
+            
+            try:
+                raw_response = client.beta.messages.with_raw_response.create(
+                    max_tokens=max_tokens,
+                    messages=messages,
+                    model=model,
+                    system=[system],
+                    tools=tool_collection.to_params(),
+                    betas=betas,
+                )
+                break  # Success, exit retry loop
+                
+            except RateLimitError as e:
+                api_response_callback(getattr(e, 'request', None), getattr(e, 'response', None), e)
+                if retry_count < max_retries:
+                    retry_count += 1
+                    # Add jitter to avoid thundering herd
+                    jitter = random.uniform(0, 0.1) * retry_delay
+                    total_delay = retry_delay + jitter
+                    print(f"Rate limit hit, waiting {total_delay:.2f} seconds before retry {retry_count}/{max_retries}")
+                    await asyncio.sleep(total_delay)
+                    retry_delay *= 2  # Exponential backoff
+                    continue
+                return messages
+                
+            except (APIStatusError, APIResponseValidationError, APIError) as e:
+                if isinstance(e, APIResponseValidationError):
+                    api_response_callback(e.request, e.response, e)
+                else:
+                    api_response_callback(getattr(e, 'request', None), getattr(e, 'response', None), e)
+                return messages
 
         api_response_callback(
             raw_response.http_response.request, raw_response.http_response, None
